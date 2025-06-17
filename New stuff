@@ -1,0 +1,316 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from scipy.signal import find_peaks
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+class SupportResistanceScanner:
+    def __init__(self, lookback_years=3, min_touches=3, volume_threshold=1.5):
+        """
+        Initialize the scanner
+        
+        Parameters:
+        lookback_years: How many years back to analyze
+        min_touches: Minimum number of times price must touch a level
+        volume_threshold: Volume multiplier for confirmation (e.g., 1.5 = 50% above average)
+        """
+        self.lookback_years = lookback_years
+        self.min_touches = min_touches
+        self.volume_threshold = volume_threshold
+        
+    def get_data(self, symbol):
+        """Download historical data"""
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=self.lookback_years * 365)
+            
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(start=start_date, end=end_date)
+            
+            if data.empty:
+                print(f"No data found for {symbol}")
+                return None
+                
+            return data
+        except Exception as e:
+            print(f"Error downloading data for {symbol}: {e}")
+            return None
+    
+    def find_support_resistance_levels(self, data, price_tolerance=0.02):
+        """
+        Find support and resistance levels
+        
+        Parameters:
+        data: DataFrame with OHLCV data
+        price_tolerance: Percentage tolerance for grouping similar price levels
+        """
+        # Use weekly data to reduce noise
+        weekly_data = data.resample('W').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna()
+        
+        # Find peaks and troughs
+        highs = weekly_data['High'].values
+        lows = weekly_data['Low'].values
+        
+        # Find resistance levels (peaks)
+        resistance_peaks, _ = find_peaks(highs, distance=4)  # At least 4 weeks apart
+        resistance_levels = highs[resistance_peaks]
+        
+        # Find support levels (troughs)
+        # Invert the lows to find peaks (which are actually troughs)
+        inverted_lows = -lows
+        support_peaks, _ = find_peaks(inverted_lows, distance=4)
+        support_levels = lows[support_peaks]
+        
+        # Group similar levels together
+        all_levels = np.concatenate([resistance_levels, support_levels])
+        level_groups = self._group_similar_levels(all_levels, price_tolerance)
+        
+        # Filter levels by number of touches and volume confirmation
+        significant_levels = []
+        
+        for level_group in level_groups:
+            level_price = np.mean(level_group)
+            touches = self._count_touches(data, level_price, price_tolerance)
+            volume_confirmed = self._check_volume_confirmation(data, level_price, price_tolerance)
+            
+            if touches >= self.min_touches:
+                level_type = self._determine_level_type(data, level_price)
+                significant_levels.append({
+                    'level': level_price,
+                    'touches': touches,
+                    'volume_confirmed': volume_confirmed,
+                    'type': level_type,
+                    'current_distance_pct': ((data['Close'].iloc[-1] - level_price) / level_price) * 100
+                })
+        
+        return significant_levels
+    
+    def _group_similar_levels(self, levels, tolerance):
+        """Group price levels that are within tolerance of each other"""
+        if len(levels) == 0:
+            return []
+            
+        sorted_levels = np.sort(levels)
+        groups = []
+        current_group = [sorted_levels[0]]
+        
+        for level in sorted_levels[1:]:
+            if abs(level - current_group[-1]) / current_group[-1] <= tolerance:
+                current_group.append(level)
+            else:
+                groups.append(current_group)
+                current_group = [level]
+        
+        groups.append(current_group)
+        return groups
+    
+    def _count_touches(self, data, level, tolerance):
+        """Count how many times price touched this level"""
+        touches = 0
+        level_range = level * tolerance
+        
+        # Check both highs and lows
+        high_touches = ((data['High'] >= level - level_range) & 
+                       (data['High'] <= level + level_range)).sum()
+        low_touches = ((data['Low'] >= level - level_range) & 
+                      (data['Low'] <= level + level_range)).sum()
+        
+        return max(high_touches, low_touches)
+    
+    def _check_volume_confirmation(self, data, level, tolerance):
+        """Check if the level was confirmed with high volume"""
+        level_range = level * tolerance
+        
+        # Find dates when price was near this level
+        near_level = ((data['High'] >= level - level_range) & 
+                     (data['High'] <= level + level_range)) | \
+                    ((data['Low'] >= level - level_range) & 
+                     (data['Low'] <= level + level_range))
+        
+        if not near_level.any():
+            return False
+            
+        # Calculate average volume
+        avg_volume = data['Volume'].rolling(50).mean()
+        
+        # Check if volume was above threshold when near level
+        volume_confirmation = (data.loc[near_level, 'Volume'] > 
+                             avg_volume.loc[near_level] * self.volume_threshold).any()
+        
+        return volume_confirmation
+    
+    def _determine_level_type(self, data, level):
+        """Determine if level is support or resistance based on current price"""
+        current_price = data['Close'].iloc[-1]
+        
+        if level > current_price:
+            return 'Resistance'
+        else:
+            return 'Support'
+    
+    def get_moving_average_signals(self, data):
+        """Calculate 50/200 day moving average signals"""
+        data = data.copy()
+        data['MA50'] = data['Close'].rolling(50).mean()
+        data['MA200'] = data['Close'].rolling(200).mean()
+        
+        current_ma50 = data['MA50'].iloc[-1]
+        current_ma200 = data['MA200'].iloc[-1]
+        current_price = data['Close'].iloc[-1]
+        
+        # Check for recent crossover (within last 20 days)
+        recent_data = data.tail(20)
+        
+        golden_cross = False
+        death_cross = False
+        
+        if len(recent_data) > 1:
+            # Check if 50MA crossed above 200MA recently (Golden Cross)
+            prev_ma50_below = (recent_data['MA50'].iloc[0] <= recent_data['MA200'].iloc[0])
+            current_ma50_above = (current_ma50 > current_ma200)
+            golden_cross = prev_ma50_below and current_ma50_above
+            
+            # Check if 50MA crossed below 200MA recently (Death Cross)
+            prev_ma50_above = (recent_data['MA50'].iloc[0] >= recent_data['MA200'].iloc[0])
+            current_ma50_below = (current_ma50 < current_ma200)
+            death_cross = prev_ma50_above and current_ma50_below
+        
+        return {
+            'current_price': current_price,
+            'ma50': current_ma50,
+            'ma200': current_ma200,
+            'price_above_ma50': current_price > current_ma50,
+            'price_above_ma200': current_price > current_ma200,
+            'ma50_above_ma200': current_ma50 > current_ma200,
+            'golden_cross_recent': golden_cross,
+            'death_cross_recent': death_cross
+        }
+    
+    def scan_symbol(self, symbol):
+        """Complete analysis for a single symbol"""
+        print(f"\nAnalyzing {symbol}...")
+        
+        data = self.get_data(symbol)
+        if data is None:
+            return None
+        
+        # Find support/resistance levels
+        levels = self.find_support_resistance_levels(data)
+        
+        # Get moving average signals
+        ma_signals = self.get_moving_average_signals(data)
+        
+        # Find levels within 10% of current price (approaching levels)
+        current_price = ma_signals['current_price']
+        approaching_levels = [level for level in levels 
+                            if abs(level['current_distance_pct']) <= 10]
+        
+        result = {
+            'symbol': symbol,
+            'current_price': current_price,
+            'ma_signals': ma_signals,
+            'all_levels': levels,
+            'approaching_levels': approaching_levels,
+            'analysis_date': datetime.now().strftime('%Y-%m-%d')
+        }
+        
+        return result
+    
+    def scan_multiple_symbols(self, symbols):
+        """Scan multiple symbols and return results"""
+        results = []
+        
+        for symbol in symbols:
+            try:
+                result = self.scan_symbol(symbol)
+                if result:
+                    results.append(result)
+            except Exception as e:
+                print(f"Error analyzing {symbol}: {e}")
+        
+        return results
+    
+    def print_summary(self, results):
+        """Print a summary of results"""
+        print("\n" + "="*80)
+        print("SUPPORT/RESISTANCE ANALYSIS SUMMARY")
+        print("="*80)
+        
+        for result in results:
+            symbol = result['symbol']
+            ma_signals = result['ma_signals']
+            approaching_levels = result['approaching_levels']
+            
+            print(f"\n{symbol}:")
+            print(f"  Current Price: ${ma_signals['current_price']:.2f}")
+            print(f"  MA50: ${ma_signals['ma50']:.2f}")
+            print(f"  MA200: ${ma_signals['ma200']:.2f}")
+            print(f"  MA Signal: {'Golden Cross' if ma_signals['golden_cross_recent'] else 'Death Cross' if ma_signals['death_cross_recent'] else 'Bullish' if ma_signals['ma50_above_ma200'] else 'Bearish'}")
+            
+            if approaching_levels:
+                print(f"  Approaching Levels:")
+                for level in approaching_levels:
+                    print(f"    {level['type']}: ${level['level']:.2f} "
+                          f"({level['current_distance_pct']:+.1f}%) "
+                          f"[{level['touches']} touches, Volume: {'✓' if level['volume_confirmed'] else '✗'}]")
+            else:
+                print("  No significant levels within 10% of current price")
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize scanner
+    scanner = SupportResistanceScanner(
+        lookback_years=3,
+        min_touches=3,
+        volume_threshold=1.5
+    )
+    
+    # List of indexes/ETFs to analyze
+    symbols = [
+        'SPY',   # S&P 500
+        'QQQ',   # Nasdaq 100
+        'IWM',   # Russell 2000
+        'EFA',   # MSCI EAFE
+        'EEM',   # Emerging Markets
+        'XLF',   # Financial Sector
+        'XLK',   # Technology Sector
+        'XLE',   # Energy Sector
+        'XLV',   # Healthcare Sector
+        'XLI',   # Industrial Sector
+    ]
+    
+    # Run the analysis
+    results = scanner.scan_multiple_symbols(symbols)
+    
+    # Print summary
+    scanner.print_summary(results)
+    
+    # Save detailed results to CSV (optional)
+    detailed_results = []
+    for result in results:
+        for level in result['all_levels']:
+            detailed_results.append({
+                'Symbol': result['symbol'],
+                'Current_Price': result['current_price'],
+                'Level': level['level'],
+                'Level_Type': level['type'],
+                'Distance_Pct': level['current_distance_pct'],
+                'Touches': level['touches'],
+                'Volume_Confirmed': level['volume_confirmed'],
+                'MA50_Above_MA200': result['ma_signals']['ma50_above_ma200'],
+                'Golden_Cross_Recent': result['ma_signals']['golden_cross_recent']
+            })
+    
+    if detailed_results:
+        df = pd.DataFrame(detailed_results)
+        df.to_csv('support_resistance_analysis.csv', index=False)
+        print(f"\nDetailed results saved to 'support_resistance_analysis.csv'")
